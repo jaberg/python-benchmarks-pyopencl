@@ -17,25 +17,38 @@ else:
     queue = cl.CommandQueue(ctx)
 
 
-vectorized_text =  """
+# TODO: figure out how to patch in the difference
+#       calculation into the GEMM code generator
+
+vectorized_text_CF =  """
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
 __kernel void kern(__global ${ctype}${KB} *A,
-                  __global ${ctype}${NB} *B,
+                  __global ${ctype}${KB} *B,
                   __global ${ctype}${NB} *C)
 {
-  ${ctype}${NB} tmp;
-  % for ii in range(MB):
-  ${ctype}${KB} Abuf${ii};
-  ${ctype}${NB} Cbuf${ii};
+  const ${ctype}${NB} beta = (${ctype}${NB})(
+      ${beta}
+  % for ii in range(NB - 1):
+      , ${beta}
   % endfor
-  ${ctype}${NB} Bbuf;
+  );
+  % for mi in range(MB):
+  ${ctype}${KB} Abuf${mi};
+  % endfor
+
+  ${ctype}${KB} Bbuf, diff;
+
+  % for mi in range(MB):
+      ${ctype}${NB} Cbuf${mi};
+  % endfor
+
   for(int mb = get_global_id(0); mb < ${NoMB}; mb += get_global_size(0))
   {
     for(int nb = get_global_id(1); nb < ${NoNB}; nb += get_global_size(1))
     {
-      % for ii in range(MB):
-      Cbuf${ii} = (${ctype}${NB})(
+      % for mi in range(MB):
+      Cbuf${mi} = (${ctype}${NB})(
                     0
                     % for foo in range(NB - 1):
                     , 0
@@ -45,31 +58,24 @@ __kernel void kern(__global ${ctype}${KB} *A,
 
       for (int kb = 0; kb < ${NoKB}; ++kb)
       {
-        // load KB columns of A at a time
-        % for ii in range(MB):
-        Abuf${ii} = A[${As0} * (mb * ${MB} + ${ii}) + kb];
+        // load MB K-blocks of A
+        % for mi in range(MB):
+            Abuf${mi} = A[${As0} * (mb * ${MB} + ${mi}) + kb];
         % endfor
 
-        % for kki in range(KB):
-        Bbuf = B[(kb * ${KB} + ${kki}) * ${Bs0} + nb];
+        // load NB K-blocks of B
+        % for ni in range(NB):
+            Bbuf = B[kb + ${Bs1} * (nb * ${NB} + ${ni})];
 
-            % for ii in range(MB):
-
-            tmp = (${ctype}${NB})(
-                    Abuf${ii}.s${kki}
-                    % for foo in range(NB - 1):
-                    , Abuf${ii}.s${kki}
-                    % endfor
-                    );
-            tmp -= Bbuf;
-            Cbuf${ii} = mad(tmp, tmp, Cbuf${ii});
+            % for mi in range(MB):
+                diff = Bbuf - Abuf${mi};
+                Cbuf${mi}.s${'%x' % ni} += dot(diff, diff);
             % endfor
-
         % endfor
       }
 
-      % for ii in range(MB):
-          C[(mb * ${MB} + ${ii}) * ${Cs0} + nb] = sqrt(Cbuf${ii});
+      % for mi in range(MB):
+          C[(mb * ${MB} + ${mi}) * ${Cs0} + nb] = sqrt(Cbuf${mi});
       % endfor
     }
   }
@@ -77,12 +83,11 @@ __kernel void kern(__global ${ctype}${KB} *A,
     """
 
 @memoize
-def pairwise_cpu_prepare_vectorized(M, N, K, dtype,
-                                    Astrides, Bstrides, Cstrides,
-                                    MB, NB, KB):
+def pairwise_cpu_prepare_vectorized_CF(alpha, beta, M, N, K, dtype,
+                               Astrides, Bstrides, Cstrides, MB, NB, KB):
     ctype = ctype_from_dtype(dtype)
     (As0, As1) = elemstrides(Astrides, dtype, KB, vecdim=1)
-    (Bs0, Bs1) = elemstrides(Bstrides, dtype, NB, vecdim=1)
+    (Bs0, Bs1) = elemstrides(Bstrides, dtype, KB, vecdim=0)
     (Cs0, Cs1) = elemstrides(Cstrides, dtype, NB, vecdim=1)
     NoMB = M // MB
     NoNB = N // NB
@@ -93,48 +98,50 @@ def pairwise_cpu_prepare_vectorized(M, N, K, dtype,
         raise BlockingError()
     if K != KB * NoKB:
         raise BlockingError()
-    text = Template(vectorized_text, output_encoding='ascii').render(**locals())
+    if NB > 16:
+        raise BlockingError('codegen breaks at this point')
+    text = Template(vectorized_text_CF, output_encoding='ascii').render(**locals())
     if 0:
         for ii, line in enumerate(text.split('\n')):
             print ii, line
     prg = cl.Program(ctx, text).build()
-    if 0:
-        print 'built!'
-
+    #print 'built!'
     return prg.kern
 
 
 comptimes = []
 def pairwise_pyopencl_cpu(A, B, C):
-    A = np.asarray(A, order='C')
-    B = np.asarray(B, order='C')
-    if C.strides[1] not in (4, 8):
-        raise NotImplementedError('output array not row-major')
     kern = None
-    global_shape = (4, 4)   # enough for different cores
-    local_shape = (1, 1)    # I think this does nothing on CPU (true?)
+    alpha = 1
+    beta = 0
 
-    # TODO: cache the result of the search
-    for MB in [16, 8, 4, 2]:
-        for NB in [16, 8, 4, 2]:
-            for KB in [16, 8, 4, 2]:
+    # TODO: patch GEMM code generators
+
+    # TODO: predictive auto-tuning here, not search
+    #       answer should depend on dtype
+    for MB in [4, 2]:
+        for NB in [2]:
+            for KB in [4, 2]:
                 if kern:
                     continue
                 try:
-                    kern = pairwise_cpu_prepare_vectorized(
+                    kern = pairwise_cpu_prepare_vectorized_CF(
+                        alpha, beta,
                         C.shape[0], C.shape[1], A.shape[1],
                         A.dtype,
                         A.strides, B.strides, C.strides,
                         MB=MB, NB=NB, KB=KB)
+                    global_shape = (8, 8)   # enough for different cores
+                    local_shape = (1, 1)
                     #print 'Using kernel for MB=%i NB=%i KB=%i' % (MB, NB, KB)
-                except (StrideError, BlockingError):
+                except StrideError:
                     pass
 
-    A_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=A)
-    B_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=B)
-    C_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=C) # --copy not necessary
+    A_buf = cl.Buffer(ctx, mf.USE_HOST_PTR, hostbuf=A)
+    B_buf = cl.Buffer(ctx, mf.USE_HOST_PTR, hostbuf=B)
+    C_buf = cl.Buffer(ctx, mf.USE_HOST_PTR, hostbuf=C)
     ev = kern(queue, global_shape, local_shape, A_buf, B_buf, C_buf)
-    cl.enqueue_copy(queue, C, C_buf)
+    #cl.enqueue_copy(queue, C, C_buf)
     queue.finish()
     if PROFILING:
         comptimes.append(1e-9 * (ev.profile.end - ev.profile.start))
@@ -144,8 +151,9 @@ def pairwise_pyopencl_cpu(A, B, C):
 def main(M=300, N=300, K=150, seed=0, dtype=np.float64):
     rng = np.random.RandomState(seed)
     A = np.asarray(rng.normal(size=(M, K)), dtype=dtype)
-    B = np.asarray(rng.normal(size=(K, N)), dtype=dtype)
+    B = np.asarray(rng.normal(size=(K, N)), dtype=dtype, order='F')
     C = np.asarray(rng.normal(size=(M, N)), dtype=dtype)
+    ref = np.sqrt(((A[:, None, :] - B.T) ** 2).sum(axis=2))
     FLOPS = M * N * (K + 1) * 3
     times = []
     for i in range(50):
@@ -157,6 +165,10 @@ def main(M=300, N=300, K=150, seed=0, dtype=np.float64):
         print M, N, K, dtype, 'pyopencl time: ',
         print (t1 - t0), 'GFlops', FLOPS / (t1 - t0) / (1000 ** 3)
         times.append(t1 - t0)
+
+        if not np.allclose(ref, C):
+            print np.max(abs(ref - C))
+            raise ValueError('wrong answer', ref, C)
 
 
     print M, N, K, dtype,

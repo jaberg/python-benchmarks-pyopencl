@@ -105,7 +105,7 @@ class StrideError(Exception):
 class BlockingError(Exception):
     """BlockingError"""
 
-vectorized_text =  """
+vectorized_text_CC =  """
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 __kernel void kern(__global ${ctype}${KB} *A,
                   __global ${ctype}${NB} *B,
@@ -149,9 +149,9 @@ __kernel void kern(__global ${ctype}${KB} *A,
             % for ii in range(MB):
 
             tmp = (${ctype}${NB})(
-                    Abuf${ii}.s${kki}
+                    Abuf${ii}.s${'%x' % kki}
                     % for foo in range(NB - 1):
-                    , Abuf${ii}.s${kki}
+                    , Abuf${ii}.s${'%x' % kki}
                     % endfor
                     );
             Cbuf${ii} = mad(tmp, Bbuf, Cbuf${ii});
@@ -187,7 +187,7 @@ __kernel void kern(__global ${ctype}${KB} *A,
 
 
 @memoize
-def gemm_cpu_prepare_vectorized(alpha, beta, M, N, K, dtype,
+def gemm_cpu_prepare_vectorized_CC(alpha, beta, M, N, K, dtype,
                                Astrides, Bstrides, Cstrides, MB, NB, KB):
     ctype = ctype_from_dtype(dtype)
     (As0, As1) = elemstrides(Astrides, dtype, KB, vecdim=1)
@@ -202,7 +202,115 @@ def gemm_cpu_prepare_vectorized(alpha, beta, M, N, K, dtype,
         raise BlockingError()
     if K != KB * NoKB:
         raise BlockingError()
-    text = Template(vectorized_text, output_encoding='ascii').render(**locals())
+    if KB > 16:
+        raise BlockingError('codegen breaks at this point')
+    text = Template(vectorized_text_CC, output_encoding='ascii').render(**locals())
+    if 0:
+        for ii, line in enumerate(text.split('\n')):
+            print ii, line
+    prg = cl.Program(ctx, text).build()
+    #print 'built!'
+
+    return prg.kern
+
+
+vectorized_text_CF =  """
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+
+__kernel void kern(__global ${ctype}${KB} *A,
+                  __global ${ctype}${KB} *B,
+                  __global ${ctype}${NB} *C)
+{
+  const ${ctype}${NB} beta = (${ctype}${NB})(
+      ${beta}
+  % for ii in range(NB - 1):
+      , ${beta}
+  % endfor
+  );
+  % for mi in range(MB):
+  ${ctype}${KB} Abuf${mi};
+  % endfor
+
+  ${ctype}${KB} Bbuf;
+
+  % for mi in range(MB):
+      ${ctype}${NB} Cbuf${mi};
+  % endfor
+
+  for(int mb = get_global_id(0); mb < ${NoMB}; mb += get_global_size(0))
+  {
+    for(int nb = get_global_id(1); nb < ${NoNB}; nb += get_global_size(1))
+    {
+      % for mi in range(MB):
+      Cbuf${mi} = (${ctype}${NB})(
+                    0
+                    % for foo in range(NB - 1):
+                    , 0
+                    % endfor
+                    );
+      % endfor
+
+      for (int kb = 0; kb < ${NoKB}; ++kb)
+      {
+        // load MB K-blocks of A
+        % for mi in range(MB):
+            Abuf${mi} = A[${As0} * (mb * ${MB} + ${mi}) + kb];
+        % endfor
+
+        // load NB K-blocks of B
+        % for ni in range(NB):
+            Bbuf = B[kb + ${Bs1} * (nb * ${NB} + ${ni})];
+
+            % for mi in range(MB):
+                Cbuf${mi}.s${'%x' % ni} += dot(Bbuf, Abuf${mi});
+            % endfor
+        % endfor
+      }
+
+      % if alpha != 1:
+          % for ii in range(MB):
+              Cbuf${ii} *= (${ctype}${NB})(
+                    ${alpha}
+                    % for foo in range(NB - 1):
+                    , ${alpha}
+                    % endfor
+                    );
+          % endfor
+      % endif
+
+      % for ii in range(MB):
+          % if beta == 0:
+              C[(mb * ${MB} + ${ii}) * ${Cs0} + nb] = Cbuf${ii};
+          % elif beta == 1:
+              C[(mb * ${MB} + ${ii}) * ${Cs0} + nb] += Cbuf${ii};
+          % else:
+              C[(mb * ${MB} + ${ii}) * ${Cs0} + nb] = mad(beta, C[(mb* ${MB} + ${ii}) * ${Cs0} + nb], Cbuf${ii});
+          % endif
+      % endfor
+    }
+  }
+}
+    """
+
+@memoize
+def gemm_cpu_prepare_vectorized_CF(alpha, beta, M, N, K, dtype,
+                               Astrides, Bstrides, Cstrides, MB, NB, KB):
+    ctype = ctype_from_dtype(dtype)
+    (As0, As1) = elemstrides(Astrides, dtype, KB, vecdim=1)
+    (Bs0, Bs1) = elemstrides(Bstrides, dtype, KB, vecdim=0)
+    (Cs0, Cs1) = elemstrides(Cstrides, dtype, NB, vecdim=1)
+    NoMB = M // MB
+    NoNB = N // NB
+    NoKB = K // KB
+    if M != MB * NoMB:
+        raise BlockingError()
+    if N != NB * NoNB:
+        raise BlockingError()
+    if K != KB * NoKB:
+        raise BlockingError()
+    if NB > 16:
+        raise BlockingError('codegen breaks at this point')
+    text = Template(vectorized_text_CF, output_encoding='ascii').render(**locals())
     if 0:
         for ii, line in enumerate(text.split('\n')):
             print ii, line
@@ -215,32 +323,52 @@ def gemm_cpu_prepare_vectorized(alpha, beta, M, N, K, dtype,
 comptimes = []
 def gemm_pyopencl_cpu(alpha, A, B, beta, C):
     kern = None
-    global_shape = (4, 4)   # enough for different cores
-    local_shape = (1, 1)    # I think this does nothing on CPU (true?)
+    # TODO: fix this to number of CPU cores, as read from cl
 
-    # TODO: some values of these constants that should work, do not.
-    # e.g. 16, 8, 8 -> wrong answer
-    #      4, 4, 8  -> segfault
-    for MB in [8, 4, 2]:
+    # TODO: predictive auto-tuning here, not search
+    #       answer should depend on dtype
+    for MB in [32, 16, 8, 4, 2]:
         for NB in [8, 4, 2]:
-            for KB in [8, 4, 2]:
+            for KB in [4, 2]:
                 if kern:
                     continue
                 try:
-                    kern = gemm_cpu_prepare_vectorized(
+                    kern = gemm_cpu_prepare_vectorized_CC(
                         alpha, beta,
                         C.shape[0], C.shape[1], A.shape[1],
                         A.dtype,
                         A.strides, B.strides, C.strides,
                         MB=MB, NB=NB, KB=KB)
-                    #print 'Using kernel for MB=%i NB=%i KB=%i' % (MB, NB, KB)
+                    global_shape = (8, 1)   # enough for different cores
+                    local_shape = (1, 1)
+                    print 'Using kernel for MB=%i NB=%i KB=%i' % (MB, NB, KB)
+                except StrideError:
+                    pass
+    for MB in [4, 2]:
+        for NB in [2]:
+            for KB in [4, 2]:
+                if kern:
+                    continue
+                try:
+                    kern = gemm_cpu_prepare_vectorized_CF(
+                        alpha, beta,
+                        C.shape[0], C.shape[1], A.shape[1],
+                        A.dtype,
+                        A.strides, B.strides, C.strides,
+                        MB=MB, NB=NB, KB=KB)
+                    global_shape = (8, 8)   # enough for different cores
+                    local_shape = (1, 1)
+                    print 'Using kernel for MB=%i NB=%i KB=%i' % (MB, NB, KB)
                 except StrideError:
                     pass
     if kern is None:
+        print 'Using reference kernel'
         kern = gemm_cpu_prepare_reference(alpha, beta,
                                           C.shape[0], C.shape[1], A.shape[1],
                                           A.dtype,
                                           A.strides, B.strides, C.strides)
+        global_shape = (8, 8)   # enough for different cores
+        local_shape = (1, 1)
 
     A_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=A)
     B_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=B)
@@ -257,29 +385,30 @@ benchmarks = (
     gemm_pyopencl_cpu,
 )
 
-NNN = 1024 * 2
-def main(shape=(NNN, NNN, NNN), seed=0, dtype=np.float32):
+def mainCC1024(M=1024, N=1024, K=1024, seed=0, dtype=np.float64):
     rng = np.random.RandomState(seed)
-    A = np.asarray(rng.normal(size=(shape[0], shape[1])), dtype=dtype)
-    B = np.asarray(rng.normal(size=(shape[1], shape[2])), dtype=dtype)
-    C = np.asarray(rng.normal(size=(shape[0], shape[2])), dtype=dtype)
+    A = np.asarray(rng.normal(size=(M, K)), dtype=dtype)
+    B = np.asarray(rng.normal(size=(K, N)), dtype=dtype)
+    C = np.asarray(rng.normal(size=(M, N)), dtype=dtype)
     C2 = np.empty_like(C)
     Z = np.ones(10 * 1024 * 1024)
     alpha = 1.0
     beta = 0.0
-    FLOPS = shape[0] * shape[1] * (shape[2] + 1) * 2
-    for i in range(500):
+    FLOPS = M * N * (K + 1) * 2
+    times = []
+    for i in range(20):
         rng.seed(i)
-        C[:] = np.asarray(rng.normal(size=(shape[0], shape[2])), dtype=dtype)
+        C[:] = np.asarray(rng.normal(size=(M, N)), dtype=dtype)
 
         t0 = time.time()
         gemm_pyopencl_cpu(alpha, A, B, beta, C)
         t1 = time.time()
         print 'pyopencl time: ', (t1 - t0), 'GFlops', FLOPS / (t1 - t0) / (1000 ** 3)
+        times.append(t1 - t0)
         continue
 
         rng.seed(i)
-        C2[:] = np.asarray(rng.normal(size=(shape[0], shape[2])), dtype=dtype)
+        C2[:] = np.asarray(rng.normal(size=(M, N)), dtype=dtype)
 
         t0 = time.time()
         C3 = alpha * np.dot( A, B) + beta * C2
@@ -292,5 +421,87 @@ def main(shape=(NNN, NNN, NNN), seed=0, dtype=np.float32):
         Z.sum()
         time.sleep(1)
 
+    print M, N, K, dtype,
+    print 'best GFLOP/s', FLOPS / min(times) / (1000 ** 3)
+    print M, N, K, dtype,
+    print 'avg  GFLOP/s', FLOPS / np.mean(times) / (1000 ** 3)
+
+def mainCC2K():
+    return mainCC1024(M=2048, N=2048, K=2048)
+
+def mainCC512():
+    return mainCC1024(M=512, N=512, K=512)
+
+def mainCC256():
+    return mainCC1024(M=256, N=256, K=256)
+
+def mainCC128():
+    return mainCC1024(M=128, N=128, K=128)
+
+def mainCC2Kf():
+    return mainCC1024(M=2048, N=2048, K=2048, dtype=np.float32)
+
+def mainCC1024f():
+    return mainCC1024(M=1024, N=1024, K=1024, dtype=np.float32)
+
+def mainCC512f():
+    return mainCC1024(M=512, N=512, K=512, dtype=np.float32)
+
+def mainCC128f():
+    return mainCC1024(M=128, N=128, K=128, dtype=np.float32)
+
+def mainCF1024(M=1024, N=1024, K=1024, seed=0, dtype=np.float64,
+        alpha=1.2,
+        beta=0.1):
+    rng = np.random.RandomState(seed)
+    A = np.asarray(rng.normal(size=(M, K)), dtype=dtype)
+    B = np.asarray(rng.normal(size=(K, N)), dtype=dtype, order='F')
+    C = np.asarray(rng.normal(size=(M, N)), dtype=dtype)
+    C2 = np.empty_like(C)
+    FLOPS = M * N * (K + 1) * 2
+    times = []
+    for i in range(20):
+        rng.seed(i)
+        C[:] = np.asarray(rng.normal(size=(M, N)), dtype=dtype)
+
+        t0 = time.time()
+        gemm_pyopencl_cpu(alpha, A, B, beta, C)
+        t1 = time.time()
+        print 'pyopencl time: ', (t1 - t0), 'GFlops', FLOPS / (t1 - t0) / (1000 ** 3)
+        times.append(t1 - t0)
+
+        rng.seed(i)
+        C2[:] = np.asarray(rng.normal(size=(M, N)), dtype=dtype)
+
+        t0 = time.time()
+        C3 = alpha * np.dot( A, B) + beta * C2
+        t1 = time.time()
+        print 'np.dot time:   ', (t1 - t0), 'GFlops', FLOPS / (t1 - t0) / (1000 ** 3)
+
+        if not np.allclose(C, C3, atol=1e-3, rtol=1e-3):
+            print np.max(abs(C - C3))
+            raise ValueError('wrong answer', C, C3)
+        # -- clear processor cache
+
+    print M, N, K, dtype,
+    print 'best GFLOP/s', FLOPS / min(times) / (1000 ** 3)
+    print M, N, K, dtype,
+    print 'avg  GFLOP/s', FLOPS / np.mean(times) / (1000 ** 3)
+
+def mainCF512():
+    return mainCF1024(M=512, N=512, K=512, dtype=np.float64)
+
+def mainCF128():
+    return mainCF1024(M=128, N=128, K=128, dtype=np.float64)
+
+def mainCF1024f():
+    return mainCF1024(M=1024, N=1024, K=1024, dtype=np.float32)
+
+def mainCF512f():
+    return mainCF1024(M=512, N=512, K=512, dtype=np.float32)
+
+def mainCF128f():
+    return mainCF1024(M=128, N=128, K=128, dtype=np.float32)
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(globals()[sys.argv[1]]())
