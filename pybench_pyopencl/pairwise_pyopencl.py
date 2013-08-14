@@ -3,8 +3,8 @@ import time
 import numpy as np
 from mako.template import Template
 import pyopencl as cl
-from ..gemm.gemm_pyopencl import memoize, BlockingError, StrideError
-from ..gemm.gemm_pyopencl import elemstrides, ctype_from_dtype
+from gemm_pyopencl import memoize, BlockingError, StrideError
+from gemm_pyopencl import elemstrides, ctype_from_dtype
 mf = cl.mem_flags
 PROFILING = 0
 
@@ -94,16 +94,22 @@ def pairwise_cpu_prepare_vectorized(M, N, K, dtype,
     if K != KB * NoKB:
         raise BlockingError()
     text = Template(vectorized_text, output_encoding='ascii').render(**locals())
-    for ii, line in enumerate(text.split('\n')):
-        print ii, line
+    if 0:
+        for ii, line in enumerate(text.split('\n')):
+            print ii, line
     prg = cl.Program(ctx, text).build()
-    print 'built!'
+    if 0:
+        print 'built!'
 
     return prg.kern
 
 
 comptimes = []
 def pairwise_pyopencl_cpu(A, B, C):
+    A = np.asarray(A, order='C')
+    B = np.asarray(B, order='C')
+    if C.strides[1] not in (4, 8):
+        raise NotImplementedError('output array not row-major')
     kern = None
     global_shape = (4, 4)   # enough for different cores
     local_shape = (1, 1)    # I think this does nothing on CPU (true?)
@@ -120,13 +126,13 @@ def pairwise_pyopencl_cpu(A, B, C):
                         A.dtype,
                         A.strides, B.strides, C.strides,
                         MB=MB, NB=NB, KB=KB)
-                    print 'Using kernel for MB=%i NB=%i KB=%i' % (MB, NB, KB)
+                    #print 'Using kernel for MB=%i NB=%i KB=%i' % (MB, NB, KB)
                 except (StrideError, BlockingError):
                     pass
 
     A_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=A)
     B_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=B)
-    C_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=C)
+    C_buf = cl.Buffer(ctx, mf.COPY_HOST_PTR, hostbuf=C) # --copy not necessary
     ev = kern(queue, global_shape, local_shape, A_buf, B_buf, C_buf)
     cl.enqueue_copy(queue, C, C_buf)
     queue.finish()

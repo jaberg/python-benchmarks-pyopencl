@@ -203,10 +203,11 @@ def gemm_cpu_prepare_vectorized(alpha, beta, M, N, K, dtype,
     if K != KB * NoKB:
         raise BlockingError()
     text = Template(vectorized_text, output_encoding='ascii').render(**locals())
-    for ii, line in enumerate(text.split('\n')):
-        print ii, line
+    if 0:
+        for ii, line in enumerate(text.split('\n')):
+            print ii, line
     prg = cl.Program(ctx, text).build()
-    print 'built!'
+    #print 'built!'
 
     return prg.kern
 
@@ -232,7 +233,7 @@ def gemm_pyopencl_cpu(alpha, A, B, beta, C):
                         A.dtype,
                         A.strides, B.strides, C.strides,
                         MB=MB, NB=NB, KB=KB)
-                    print 'Using kernel for MB=%i NB=%i KB=%i' % (MB, NB, KB)
+                    #print 'Using kernel for MB=%i NB=%i KB=%i' % (MB, NB, KB)
                 except StrideError:
                     pass
     if kern is None:
